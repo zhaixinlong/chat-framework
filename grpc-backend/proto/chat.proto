@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package chat.v1;
+option go_package = "grpc-backend/pb";
+
+message ChatMessage {
+  string type = 1;
+  string username = 2;
+  string content = 3;
+  string time = 4;
+}
+
+service ChatService {
+  rpc ChatStream(stream ChatMessage) returns (stream ChatMessage);
+}

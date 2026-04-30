@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SSE 即时通讯</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #0ea5e9, #6366f1);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .login-box {
+            background: white;
+            padding: 40px;
+            border-radius: 12px;
+            text-align: center;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+        .login-box h2 { color: #0ea5e9; margin-bottom: 20px; }
+        .login-box input { padding: 12px; margin: 10px 0; width: 250px; border: 2px solid #e5e7eb; border-radius: 8px; font-size: 16px; }
+        .login-box button { padding: 12px 30px; background: #0ea5e9; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; }
+        .login-box button:hover { background: #0284c7; }
+
+        .chat-box {
+            display: none;
+            background: white;
+            width: 600px;
+            height: 500px;
+            border-radius: 12px;
+            flex-direction: column;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+        .chat-header { background: #0ea5e9; color: white; padding: 15px; font-weight: bold; display: flex; justify-content: space-between; }
+        .chat-messages { flex: 1; padding: 15px; overflow-y: auto; background: #f3f4f6; }
+        .chat-input { padding: 15px; border-top: 1px solid #e5e7eb; display: flex; }
+        .chat-input input { flex: 1; padding: 12px; border: 2px solid #e5e7eb; border-radius: 8px; margin-right: 10px; font-size: 14px; }
+        .chat-input button { padding: 12px 20px; background: #0ea5e9; color: white; border: none; border-radius: 8px; cursor: pointer; }
+
+        .msg { margin-bottom: 12px; }
+        .msg .time { font-size: 11px; color: #9ca3af; margin-top: 4px; }
+        .msg .name { font-size: 12px; color: #6b7280; margin-bottom: 2px; }
+        .msg .text { padding: 10px 14px; border-radius: 10px; display: inline-block; max-width: 70%; word-wrap: break-word; }
+        .msg.self { text-align: right; }
+        .msg.self .text { background: #bae6fd; }
+        .msg.other .text { background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .msg.system { text-align: center; }
+        .msg.system .text { background: none; color: #6b7280; font-size: 13px; }
+    </style>
+</head>
+<body>
+
+<div class="login-box" id="loginBox">
+    <h2>💬 SSE 聊天室</h2>
+    <br>
+    <input type="text" id="username" placeholder="输入昵称" maxlength="20">
+    <br><br>
+    <button onclick="login()">进入聊天</button>
+</div>
+
+<div class="chat-box" id="chatBox">
+    <div class="chat-header">
+        <span>💬 聊天室</span>
+        <span id="onlineCount">在线: 0</span>
+    </div>
+    <div class="chat-messages" id="messages"></div>
+    <div class="chat-input">
+        <input type="text" id="msgInput" placeholder="输入消息..." maxlength="500">
+        <button onclick="send()">发送</button>
+    </div>
+</div>
+
+<script>
+var source = null;
+var username = '';
+var baseUrl = '';
+
+function login() {
+    username = document.getElementById('username').value.trim();
+    if (!username) { alert('请输入昵称'); return; }
+
+    document.getElementById('loginBox').style.display = 'none';
+    document.getElementById('chatBox').style.display = 'flex';
+
+    // 建立 SSE 连接接收消息
+    var protocol = location.protocol === 'https:' ? 'https:' : 'http:';
+    baseUrl = protocol + '//' + location.host;
+    source = new EventSource(baseUrl + '/sse?username=' + encodeURIComponent(username));
+
+    source.onmessage = function(e) {
+        var data = JSON.parse(e.data);
+        addMessage(data);
+    };
+
+    source.onerror = function() {
+        console.log('SSE 连接出错，浏览器会自动重连');
+    };
+
+    // 更新在线人数
+    updateOnlineCount();
+    setInterval(updateOnlineCount, 5000);
+}
+
+function send() {
+    var input = document.getElementById('msgInput');
+    var text = input.value.trim();
+    if (!text) return;
+
+    fetch(baseUrl + '/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: username, content: text })
+    });
+
+    input.value = '';
+}
+
+function addMessage(data) {
+    var div = document.createElement('div');
+    var type = data.type === 'system' ? 'system' : (data.username === username ? 'self' : 'other');
+    div.className = 'msg ' + type;
+
+    var html = '';
+    if (type === 'other') {
+        html += '<div class="name">' + escapeHtml(data.username) + '</div>';
+    }
+    html += '<div class="text">' + escapeHtml(data.content) + '</div>';
+    html += '<div class="time">' + (data.time || '') + '</div>';
+    div.innerHTML = html;
+
+    var container = document.getElementById('messages');
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+}
+
+function updateOnlineCount() {
+    fetch(baseUrl + '/api/online')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            document.getElementById('onlineCount').textContent = '在线: ' + data.count;
+        })
+        .catch(function() {});
+}
+
+function escapeHtml(text) {
+    var d = document.createElement('div');
+    d.textContent = text;
+    return d.innerHTML;
+}
+
+document.getElementById('username').onkeypress = function(e) { if(e.key==='Enter') login(); };
+document.getElementById('msgInput').onkeypress = function(e) { if(e.key==='Enter') send(); };
+</script>
+
+</body>
+</html>

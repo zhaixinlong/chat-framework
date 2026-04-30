@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>即时通讯</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .login-box {
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            text-align: center;
+        }
+        .login-box input { padding: 10px; margin: 10px 0; width: 250px; border: 1px solid #ccc; border-radius: 5px; }
+        .login-box button { padding: 10px 30px; background: #07c160; color: white; border: none; border-radius: 5px; cursor: pointer; }
+
+        .chat-box {
+            background: white;
+            width: 600px;
+            height: 500px;
+            border-radius: 10px;
+            display: none;
+            flex-direction: column;
+        }
+        .chat-header { background: #07c160; color: white; padding: 15px; font-weight: bold; }
+        .chat-messages { flex: 1; padding: 15px; overflow-y: auto; background: #f5f5f5; }
+        .chat-input { padding: 15px; border-top: 1px solid #eee; display: flex; }
+        .chat-input input { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 5px; margin-right: 10px; }
+        .chat-input button { padding: 10px 20px; background: #07c160; color: white; border: none; border-radius: 5px; cursor: pointer; }
+
+        .msg { margin-bottom: 10px; }
+        .msg .time { font-size: 11px; color: #999; }
+        .msg .name { font-size: 12px; color: #666; }
+        .msg .text { background: white; padding: 8px 12px; border-radius: 8px; display: inline-block; margin-top: 3px; max-width: 70%; word-wrap: break-word; }
+        .msg.self { text-align: right; }
+        .msg.self .text { background: #95ec69; }
+        .msg.system { text-align: center; }
+        .msg.system .text { background: none; color: #999; font-size: 12px; }
+    </style>
+</head>
+<body>
+
+<div class="login-box" id="loginBox">
+    <h2>💬 聊天室</h2>
+    <br>
+    <input type="text" id="username" placeholder="输入昵称">
+    <br><br>
+    <button onclick="login()">进入</button>
+</div>
+
+<div class="chat-box" id="chatBox">
+    <div class="chat-header">💬 聊天室 - <span id="online">在线: 1</span></div>
+    <div class="chat-messages" id="messages"></div>
+    <div class="chat-input">
+        <input type="text" id="msgInput" placeholder="输入消息..." onkeypress="if(event.key==='Enter')send()">
+        <button onclick="send()">发送</button>
+    </div>
+</div>
+
+<script>
+var ws = null;
+var username = '';
+
+function login() {
+    username = document.getElementById('username').value.trim();
+    if (!username) { alert('请输入昵称'); return; }
+
+    document.getElementById('loginBox').style.display = 'none';
+    document.getElementById('chatBox').style.display = 'flex';
+
+    var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(protocol + '//' + location.host + '/ws?username=' + encodeURIComponent(username));
+
+    ws.onopen = function() {
+        addMsg('system', '', '已连接');
+    };
+
+    ws.onmessage = function(e) {
+        var data = JSON.parse(e.data);
+        if (data.type === 'system') {
+            addMsg('system', '', data.content);
+        } else {
+            addMsg(data.username === username ? 'self' : 'other', data.username, data.content, data.time);
+        }
+    };
+
+    ws.onclose = function() {
+        addMsg('system', '', '连接断开，5秒后重连...');
+        setTimeout(function() { location.reload(); }, 5000);
+    };
+}
+
+function send() {
+    var input = document.getElementById('msgInput');
+    var text = input.value.trim();
+    if (text && ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ content: text }));
+        input.value = '';
+    }
+}
+
+function addMsg(type, name, text, time) {
+    var div = document.createElement('div');
+    div.className = 'msg ' + type;
+    var html = '';
+    if (type !== 'system') {
+        html += '<div class="name">' + name + '</div>';
+    }
+    html += '<div class="text">' + text + '</div>';
+    html += '<div class="time">' + (time || '') + '</div>';
+    div.innerHTML = html;
+
+    var container = document.getElementById('messages');
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+}
+
+document.getElementById('username').onkeypress = function(e) { if(e.key==='Enter') login(); };
+</script>
+
+</body>
+</html>
