@@ -28,27 +28,28 @@ type Client struct {
 
 // Hub 管理所有客户端
 type Hub struct {
-	clients []Client
+	clients []*Client
 	mu      sync.RWMutex
 }
 
 func NewHub() *Hub {
 	return &Hub{
-		clients: make([]Client, 0),
+		clients: make([]*Client, 0),
 	}
 }
 
 // 注册新客户端
 func (h *Hub) Register(username string) *Client {
-	client := Client{
+	client := &Client{
 		username:    username,
 		messageChan: make(chan Message, 100),
 	}
 	h.mu.Lock()
 	h.clients = append(h.clients, client)
+	count := len(h.clients)
 	h.mu.Unlock()
 
-	log.Printf("用户 %s 已连接，当前在线人数: %d", username, len(h.clients))
+	log.Printf("用户 %s 已连接，当前在线人数: %d", username, count)
 
 	// 广播加入消息
 	h.broadcast(Message{
@@ -57,22 +58,40 @@ func (h *Hub) Register(username string) *Client {
 		Time:    time.Now().Format("15:04:05"),
 	})
 
-	return &client
+	return client
 }
 
-// 移除客户端
+// Unregister preserves username-based removal for existing callers.
 func (h *Hub) Unregister(username string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
-	for i, c := range h.clients {
-		if c.username == username {
-			h.clients = append(h.clients[:i], h.clients[i+1:]...)
-			close(c.messageChan)
-			log.Printf("用户 %s 已断开，当前在线人数: %d", username, len(h.clients))
-			break
+	for i, client := range h.clients {
+		if client.username == username {
+			h.removeClient(i)
+			return
 		}
 	}
+}
+
+func (h *Hub) unregisterClient(client *Client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i, current := range h.clients {
+		if current == client {
+			h.removeClient(i)
+			return
+		}
+	}
+}
+
+// The caller holds the write lock, excluding concurrent broadcasts.
+func (h *Hub) removeClient(index int) {
+	client := h.clients[index]
+	copy(h.clients[index:], h.clients[index+1:])
+	h.clients[len(h.clients)-1] = nil
+	h.clients = h.clients[:len(h.clients)-1]
+	close(client.messageChan)
+	log.Printf("用户 %s 已断开，当前在线人数: %d", client.username, len(h.clients))
 }
 
 // 广播消息
@@ -125,7 +144,7 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := hub.Register(username)
-	defer hub.Unregister(username)
+	defer hub.unregisterClient(client)
 
 	// 设置 SSE 响应头
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -140,9 +159,14 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			log.Printf("客户端 %s 断开连接", username)
 			return
-		case msg := <-client.messageChan:
+		case msg, ok := <-client.messageChan:
+			if !ok {
+				return
+			}
 			data, _ := json.Marshal(msg)
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}

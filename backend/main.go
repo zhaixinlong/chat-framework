@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -33,7 +32,6 @@ type Hub struct {
 	register   chan *Client
 	unregister chan *Client
 	broadcast  chan Message
-	mu         sync.RWMutex
 }
 
 func NewHub() *Hub {
@@ -49,9 +47,7 @@ func (h *Hub) Run() {
 	for {
 		select {
 		case client := <-h.register:
-			h.mu.Lock()
 			h.clients[client] = true
-			h.mu.Unlock()
 			log.Printf("用户 %s 已连接，当前在线人数: %d", client.username, len(h.clients))
 
 			// 发送系统欢迎消息
@@ -60,36 +56,36 @@ func (h *Hub) Run() {
 				Content: fmt.Sprintf("欢迎 %s 加入聊天室！", client.username),
 				Time:    time.Now().Format("15:04:05"),
 			}
-			h.broadcast <- welcomeMsg
+			h.broadcastMessage(welcomeMsg)
 
 		case client := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
+			if _, ok := h.clients[client]; !ok {
+				continue
 			}
-			h.mu.Unlock()
+			delete(h.clients, client)
+			close(client.send)
 			log.Printf("用户 %s 已断开，当前在线人数: %d", client.username, len(h.clients))
-
-			// 发送系统离开消息
-			leaveMsg := Message{
+			h.broadcastMessage(Message{
 				Type:    "system",
 				Content: fmt.Sprintf("%s 已离开聊天室", client.username),
 				Time:    time.Now().Format("15:04:05"),
-			}
-			h.broadcast <- leaveMsg
+			})
 
 		case message := <-h.broadcast:
-			h.mu.RLock()
-			for client := range h.clients {
-				select {
-				case client.send <- message:
-				default:
-					close(client.send)
-					delete(h.clients, client)
-				}
-			}
-			h.mu.RUnlock()
+			h.broadcastMessage(message)
+		}
+	}
+}
+
+// Only Run owns the client map and closes client queues.
+func (h *Hub) broadcastMessage(message Message) {
+	for client := range h.clients {
+		select {
+		case client.send <- message:
+		default:
+			delete(h.clients, client)
+			close(client.send)
+			client.conn.Close()
 		}
 	}
 }
@@ -159,6 +155,9 @@ func writePump(client *Client) {
 	defer client.conn.Close()
 
 	for message := range client.send {
+		if err := client.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			return
+		}
 		err := client.conn.WriteJSON(message)
 		if err != nil {
 			log.Printf("写入错误: %v", err)

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -47,20 +48,31 @@ func (h *Hub) Register(username string, send chan *pb.ChatMessage) *Client {
 
 func (h *Hub) Unregister(username string, c *Client) {
 	h.mu.Lock()
+	removed := false
 	clients := h.clients[username]
-	for i, cl := range clients {
-		if cl == c {
-			h.clients[username] = append(clients[:i], clients[i+1:]...)
+	for i, current := range clients {
+		if current == c {
+			copy(clients[i:], clients[i+1:])
+			clients[len(clients)-1] = nil
+			clients = clients[:len(clients)-1]
+			if len(clients) == 0 {
+				delete(h.clients, username)
+			} else {
+				h.clients[username] = clients
+			}
+			close(c.send)
+			removed = true
 			break
 		}
 	}
 	h.mu.Unlock()
-
-	h.broadcast(&pb.ChatMessage{
-		Type:    "system",
-		Content: fmt.Sprintf("%s 已离开聊天室", username),
-		Time:    time.Now().Format("15:04:05"),
-	})
+	if removed {
+		h.broadcast(&pb.ChatMessage{
+			Type:    "system",
+			Content: fmt.Sprintf("%s 已离开聊天室", username),
+			Time:    time.Now().Format("15:04:05"),
+		})
+	}
 }
 
 func (h *Hub) broadcast(msg *pb.ChatMessage) {
@@ -84,47 +96,74 @@ type ChatServer struct {
 var globalHub *Hub
 
 func (s *ChatServer) ChatStream(stream pb.ChatService_ChatStreamServer) error {
-	var username string
-	var client *Client
-
-	// 读取第一条消息获取用户名
 	firstMsg, err := stream.Recv()
 	if err != nil {
+		if err == io.EOF {
+			return nil
+		}
 		return err
 	}
-	username = firstMsg.Username
+	username := firstMsg.Username
 	if username == "" {
 		username = fmt.Sprintf("用户%d", time.Now().UnixNano()%10000)
 	}
-
 	sendChan := make(chan *pb.ChatMessage, 100)
-	client = globalHub.Register(username, sendChan)
+	client := globalHub.Register(username, sendChan)
 	defer globalHub.Unregister(username, client)
 
-	// 启动发送协程
+	type receiveResult struct {
+		message *pb.ChatMessage
+		err     error
+	}
+	received := make(chan receiveResult)
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		for msg := range sendChan {
-			stream.Send(msg)
+		for {
+			message, err := stream.Recv()
+			select {
+			case received <- receiveResult{message, err}:
+			case <-done:
+				return
+			case <-stream.Context().Done():
+				return
+			}
+			if err != nil {
+				return
+			}
 		}
 	}()
 
-	// 接收循环
 	for {
-		msg, err := stream.Recv()
-		if err != nil {
-			return err
+		select {
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		case message, ok := <-sendChan:
+			if !ok {
+				return nil
+			}
+			if err := stream.Send(message); err != nil {
+				return err
+			}
+		case result := <-received:
+			if result.err == io.EOF {
+				return nil
+			}
+			if result.err != nil {
+				return result.err
+			}
+			message := result.message
+			message.Type = "chat"
+			message.Username = username
+			message.Time = time.Now().Format("15:04:05")
+			globalHub.broadcast(message)
 		}
-		msg.Type = "chat"
-		msg.Username = username
-		msg.Time = time.Now().Format("15:04:05")
-		log.Printf("[%s] %s: %s", msg.Time, msg.Username, msg.Content)
-		globalHub.broadcast(msg)
 	}
 }
 
 func serveFrontend(w http.ResponseWriter, r *http.Request) {
 	execPath, _ := os.Getwd()
-	http.ServeFile(w, r, filepath.Join(execPath, "../grpc-frontend/index.html"))
+	http.ServeFile(w, r, filepath.Join(execPath, "../sse-frontend/index.html"))
 }
 
 // SSE 端点（浏览器接收消息）
@@ -142,30 +181,8 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sendChan := make(chan *pb.ChatMessage, 100)
-	client := &Client{send: sendChan, username: username}
-
-	globalHub.mu.Lock()
-	globalHub.clients[username] = append(globalHub.clients[username], client)
-	globalHub.mu.Unlock()
-
-	defer func() {
-		globalHub.mu.Lock()
-		clients := globalHub.clients[username]
-		for i, c := range clients {
-			if c == client {
-				globalHub.clients[username] = append(clients[:i], clients[i+1:]...)
-				break
-			}
-		}
-		close(sendChan)
-		globalHub.mu.Unlock()
-	}()
-
-	globalHub.broadcast(&pb.ChatMessage{
-		Type:    "system",
-		Content: fmt.Sprintf("欢迎 %s 加入聊天室！", username),
-		Time:    time.Now().Format("15:04:05"),
-	})
+	client := globalHub.Register(username, sendChan)
+	defer globalHub.Unregister(username, client)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -175,9 +192,14 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
-		case msg := <-sendChan:
+		case msg, ok := <-sendChan:
+			if !ok {
+				return
+			}
 			data, _ := json.Marshal(msg)
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}
@@ -187,21 +209,35 @@ func main() {
 	globalHub = NewHub()
 	chatServer := &ChatServer{}
 
-	// 纯 gRPC 服务器（端口 50051，给 CLI 客户端用）
+	grpcServer := grpc.NewServer()
+	pb.RegisterChatServiceServer(grpcServer, chatServer)
+	lis, err := net.Listen("tcp", ":50051")
+	if err != nil {
+		log.Fatal("gRPC 监听失败: ", err)
+	}
 	go func() {
-		grpcServer := grpc.NewServer()
-		pb.RegisterChatServiceServer(grpcServer, chatServer)
-		lis, _ := net.Listen("tcp", ":50051")
 		log.Println("纯 gRPC 服务器启动: localhost:50051")
-		grpcServer.Serve(lis)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatal("gRPC 服务失败: ", err)
+		}
 	}()
 
-	// gRPC-Web + HTTP 服务器（端口 8082，给浏览器用）
-	wrappedServer := grpcweb.WrapServer(grpc.NewServer())
+	// Both transports expose the same registered service and Hub.
+	wrappedServer := grpcweb.WrapServer(grpcServer)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveFrontend)
 	mux.HandleFunc("/chat.v1.ChatService/ChatStream", wrappedServer.ServeHTTP)
 	mux.HandleFunc("/sse", handleSSE)
+	mux.HandleFunc("/api/online", func(w http.ResponseWriter, r *http.Request) {
+		globalHub.mu.RLock()
+		count := 0
+		for _, clients := range globalHub.clients {
+			count += len(clients)
+		}
+		globalHub.mu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int{"count": count})
+	})
 
 	// 兼容浏览器发送消息 (简单 HTTP POST)
 	mux.HandleFunc("/api/message", func(w http.ResponseWriter, r *http.Request) {
@@ -210,11 +246,19 @@ func main() {
 			return
 		}
 		var req struct{ Username, Content string }
-		json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if req.Username == "" || req.Content == "" {
+			http.Error(w, "Username and content are required", http.StatusBadRequest)
+			return
+		}
 		globalHub.broadcast(&pb.ChatMessage{
 			Type: "chat", Username: req.Username, Content: req.Content,
 			Time: time.Now().Format("15:04:05"),
 		})
+		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 

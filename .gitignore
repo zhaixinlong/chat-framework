@@ -1,3 +1,9 @@
 **/.qwen
 
 **/.DS_Store
+
+# Local Go build products
+/backend/server
+/grpc-backend/server
+/grpc-client/client
+/sse-backend/server
